@@ -710,12 +710,20 @@ def _run_gateway(
                 logger.info("Dream cron job completed (base)")
             except Exception:
                 logger.exception("Dream cron job failed (base)")
-            for key, dream in list(agent._user_dreams.items()):
-                try:
-                    await dream.run()
-                    logger.info("Dream cron job completed for {}", key)
-                except Exception:
-                    logger.exception("Dream cron job failed for {}", key)
+            # Run dream for all existing user workspaces on disk
+            users_dir = agent.workspace / "users"
+            if users_dir.exists():
+                for user_ws in users_dir.iterdir():
+                    if not user_ws.is_dir():
+                        continue
+                    # Derive session key from directory name (reverse of safe_filename)
+                    session_key = user_ws.name
+                    dream = agent._get_user_dream(session_key)
+                    try:
+                        await dream.run()
+                        logger.info("Dream cron job completed for {}", session_key)
+                    except Exception:
+                        logger.exception("Dream cron job failed for {}", session_key)
             return None
 
         from nanobot.agent.tools.cron import CronTool
