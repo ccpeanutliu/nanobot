@@ -274,7 +274,19 @@ class AgentLoop:
         safe_key = safe_filename(session_key.replace(":", "_"))
         ws = self.workspace / "users" / safe_key
         ws.mkdir(parents=True, exist_ok=True)
+        self._init_user_workspace_templates(ws)
         return ws
+
+    def _init_user_workspace_templates(self, ws: Path) -> None:
+        """Copy USER.md and memory/MEMORY.md from base workspace if they don't exist yet."""
+        import shutil
+        (ws / "memory").mkdir(exist_ok=True)
+        for src, dst in [
+            (self.workspace / "USER.md", ws / "USER.md"),
+            (self.workspace / "memory" / "MEMORY.md", ws / "memory" / "MEMORY.md"),
+        ]:
+            if src.exists() and not dst.exists():
+                shutil.copy2(src, dst)
 
     def _get_user_context(self, session_key: str) -> ContextBuilder:
         if session_key not in self._user_contexts:

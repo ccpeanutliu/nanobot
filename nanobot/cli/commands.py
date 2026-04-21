@@ -707,9 +707,15 @@ def _run_gateway(
         if job.name == "dream":
             try:
                 await agent.dream.run()
-                logger.info("Dream cron job completed")
+                logger.info("Dream cron job completed (base)")
             except Exception:
-                logger.exception("Dream cron job failed")
+                logger.exception("Dream cron job failed (base)")
+            for key, dream in list(agent._user_dreams.items()):
+                try:
+                    await dream.run()
+                    logger.info("Dream cron job completed for {}", key)
+                except Exception:
+                    logger.exception("Dream cron job failed for {}", key)
             return None
 
         from nanobot.agent.tools.cron import CronTool

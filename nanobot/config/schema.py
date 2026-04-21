@@ -37,7 +37,7 @@ class DreamConfig(Base):
     _HOUR_MS = 3_600_000
 
     interval_h: int = Field(default=2, ge=1)  # Every 2 hours by default
-    cron: str | None = Field(default=None, exclude=True)  # Legacy compatibility override
+    cron: str | None = Field(default=None)  # Legacy compatibility override
     model_override: str | None = Field(
         default=None,
         validation_alias=AliasChoices("modelOverride", "model", "model_override"),
