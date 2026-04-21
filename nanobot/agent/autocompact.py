@@ -16,10 +16,14 @@ if TYPE_CHECKING:
 class AutoCompact:
     _RECENT_SUFFIX_MESSAGES = 8
 
-    def __init__(self, sessions: SessionManager, consolidator: Consolidator,
-                 session_ttl_minutes: int = 0):
+    def __init__(
+        self,
+        sessions: SessionManager,
+        consolidator: "Consolidator | Callable[[str], Consolidator]",
+        session_ttl_minutes: int = 0,
+    ):
         self.sessions = sessions
-        self.consolidator = consolidator
+        self._consolidator_or_factory = consolidator
         self._ttl = session_ttl_minutes
         self._archiving: set[str] = set()
         self._summaries: dict[str, tuple[str, datetime]] = {}
@@ -85,7 +89,9 @@ class AutoCompact:
             last_active = session.updated_at
             summary = ""
             if archive_msgs:
-                summary = await self.consolidator.archive(archive_msgs) or ""
+                factory = self._consolidator_or_factory
+                consolidator = factory(key) if callable(factory) else factory
+                summary = await consolidator.archive(archive_msgs) or ""
             if summary and summary != "(nothing)":
                 self._summaries[key] = (summary, last_active)
                 session.metadata["_last_summary"] = {"text": summary, "last_active": last_active.isoformat()}

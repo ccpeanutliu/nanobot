@@ -193,6 +193,17 @@ class AgentLoop:
         self._start_time = time.time()
         self._last_usage: dict[str, int] = {}
         self._extra_hooks: list[AgentHook] = hooks or []
+        self._timezone = timezone
+        self._disabled_skills = disabled_skills
+        # Per-user caches: keyed by session_key (e.g. "api:alice", "telegram:12345")
+        self._user_contexts: dict[str, ContextBuilder] = {}
+        self._user_consolidators: dict[str, Consolidator] = {}
+        self._user_dreams: dict[str, Dream] = {}
+        # Dream config overrides (set by CLI after construction)
+        self._dream_model_override: str | None = None
+        self._dream_max_batch_size: int | None = None
+        self._dream_max_iterations: int | None = None
+        self._dream_annotate_line_ages: bool = True
 
         self.context = ContextBuilder(workspace, timezone=timezone, disabled_skills=disabled_skills)
         self.sessions = session_manager or SessionManager(workspace)
@@ -239,14 +250,14 @@ class AgentLoop:
         )
         self.auto_compact = AutoCompact(
             sessions=self.sessions,
-            consolidator=self.consolidator,
+            consolidator=self._get_user_consolidator,
             session_ttl_minutes=session_ttl_minutes,
         )
         self.dream = Dream(
             store=self.context.memory,
             provider=provider,
             model=self.model,
-        )
+        )  # base-workspace dream, used by CLI scheduler only
         self._register_default_tools()
         if _tc.my.enable:
             self.tools.register(MyTool(loop=self, modify_allowed=_tc.my.allow_set))
@@ -254,6 +265,56 @@ class AgentLoop:
         self._current_iteration: int = 0
         self.commands = CommandRouter()
         register_builtin_commands(self.commands)
+
+    # -- Per-user workspace helpers ------------------------------------------
+
+    def _user_workspace(self, session_key: str) -> Path:
+        """Return (and create) a workspace subdirectory isolated per session_key."""
+        from nanobot.utils.helpers import safe_filename
+        safe_key = safe_filename(session_key.replace(":", "_"))
+        ws = self.workspace / "users" / safe_key
+        ws.mkdir(parents=True, exist_ok=True)
+        return ws
+
+    def _get_user_context(self, session_key: str) -> ContextBuilder:
+        if session_key not in self._user_contexts:
+            self._user_contexts[session_key] = ContextBuilder(
+                self._user_workspace(session_key),
+                timezone=self._timezone,
+                disabled_skills=self._disabled_skills,
+            )
+        return self._user_contexts[session_key]
+
+    def _get_user_consolidator(self, session_key: str) -> Consolidator:
+        if session_key not in self._user_consolidators:
+            ctx = self._get_user_context(session_key)
+            self._user_consolidators[session_key] = Consolidator(
+                store=ctx.memory,
+                provider=self.provider,
+                model=self.model,
+                sessions=self.sessions,
+                context_window_tokens=self.context_window_tokens,
+                build_messages=ctx.build_messages,
+                get_tool_definitions=self.tools.get_definitions,
+                max_completion_tokens=self.provider.generation.max_tokens,
+            )
+        return self._user_consolidators[session_key]
+
+    def _get_user_dream(self, session_key: str) -> Dream:
+        if session_key not in self._user_dreams:
+            ctx = self._get_user_context(session_key)
+            d = Dream(store=ctx.memory, provider=self.provider, model=self.model)
+            if self._dream_model_override:
+                d.model = self._dream_model_override
+            if self._dream_max_batch_size is not None:
+                d.max_batch_size = self._dream_max_batch_size
+            if self._dream_max_iterations is not None:
+                d.max_iterations = self._dream_max_iterations
+            d.annotate_line_ages = self._dream_annotate_line_ages
+            self._user_dreams[session_key] = d
+        return self._user_dreams[session_key]
+
+    # -- Default tools registration ------------------------------------------
 
     def _register_default_tools(self) -> None:
         """Register the default set of tools."""
@@ -407,11 +468,12 @@ class AgentLoop:
                 if media:
                     content, media = extract_documents(content, media)
                     media = media or None
-                user_content = self.context._build_user_content(content, media)
-                runtime_ctx = self.context._build_runtime_context(
+                _ctx = self._get_user_context(session.key) if session else self.context
+                user_content = _ctx._build_user_content(content, media)
+                runtime_ctx = _ctx._build_runtime_context(
                     pending_msg.channel,
                     pending_msg.chat_id,
-                    self.context.timezone,
+                    _ctx.timezone,
                 )
                 if isinstance(user_content, str):
                     merged: str | list[dict[str, Any]] = f"{runtime_ctx}\n\n{user_content}"
@@ -677,7 +739,9 @@ class AgentLoop:
 
             session, pending = self.auto_compact.prepare_session(session, key)
 
-            await self.consolidator.maybe_consolidate_by_tokens(
+            sys_user_ctx = self._get_user_context(key)
+            sys_user_consolidator = self._get_user_consolidator(key)
+            await sys_user_consolidator.maybe_consolidate_by_tokens(
                 session,
                 session_summary=pending,
             )
@@ -695,7 +759,7 @@ class AgentLoop:
 
             # Subagent content is already in `history` above; passing it again
             # as current_message would double-project it into the prompt.
-            messages = self.context.build_messages(
+            messages = sys_user_ctx.build_messages(
                 history=history,
                 current_message="" if is_subagent else msg.content,
                 channel=channel,
@@ -710,7 +774,7 @@ class AgentLoop:
             self._save_turn(session, all_msgs, 1 + len(history))
             self._clear_runtime_checkpoint(session)
             self.sessions.save(session)
-            self._schedule_background(self.consolidator.maybe_consolidate_by_tokens(session))
+            self._schedule_background(sys_user_consolidator.maybe_consolidate_by_tokens(session))
             return OutboundMessage(
                 channel=channel,
                 chat_id=chat_id,
@@ -741,7 +805,9 @@ class AgentLoop:
         if result := await self.commands.dispatch(ctx):
             return result
 
-        await self.consolidator.maybe_consolidate_by_tokens(
+        user_ctx = self._get_user_context(key)
+        user_consolidator = self._get_user_consolidator(key)
+        await user_consolidator.maybe_consolidate_by_tokens(
             session,
             session_summary=pending,
         )
@@ -753,7 +819,7 @@ class AgentLoop:
 
         history = session.get_history(max_messages=0)
 
-        initial_messages = self.context.build_messages(
+        initial_messages = user_ctx.build_messages(
             history=history,
             current_message=msg.content,
             session_summary=pending,
@@ -822,7 +888,7 @@ class AgentLoop:
         self._clear_pending_user_turn(session)
         self._clear_runtime_checkpoint(session)
         self.sessions.save(session)
-        self._schedule_background(self.consolidator.maybe_consolidate_by_tokens(session))
+        self._schedule_background(user_consolidator.maybe_consolidate_by_tokens(session))
 
         # When follow-up messages were injected mid-turn, a later natural
         # language reply may address those follow-ups and should not be

@@ -882,11 +882,17 @@ def _run_gateway(
             await server.serve_forever()
     # Register Dream system job (always-on, idempotent on restart)
     dream_cfg = config.agents.defaults.dream
+    # Apply dream config to base dream (used by CLI scheduler) and store
+    # overrides so per-user dreams created later inherit the same settings.
     if dream_cfg.model_override:
         agent.dream.model = dream_cfg.model_override
+        agent._dream_model_override = dream_cfg.model_override
     agent.dream.max_batch_size = dream_cfg.max_batch_size
     agent.dream.max_iterations = dream_cfg.max_iterations
     agent.dream.annotate_line_ages = dream_cfg.annotate_line_ages
+    agent._dream_max_batch_size = dream_cfg.max_batch_size
+    agent._dream_max_iterations = dream_cfg.max_iterations
+    agent._dream_annotate_line_ages = dream_cfg.annotate_line_ages
     from nanobot.cron.types import CronJob, CronPayload
     cron.register_system_job(CronJob(
         id="dream",
